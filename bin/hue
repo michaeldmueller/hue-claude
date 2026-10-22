@@ -17,7 +17,7 @@ export PATH
 builtin_event() {
   case "$1" in
 # BEGIN EVENTS
-claude-done)  signal alternating 1500 green white;;          # Claude Code finished a turn
+claude-done)  signal alternating  1500 green green ;;    # Claude Code finished a turn (solid green, no blink)
 claude-wait)  signal alternating  3000 amber red ;;      # Claude Code is waiting on a permission
 # END EVENTS
     *) return 1 ;;
@@ -28,8 +28,7 @@ claude-wait)  signal alternating  3000 amber red ;;      # Claude Code is waitin
 color_xy() {
   case "$1" in
     red)    echo "0.675 0.322" ;;
-    green)  echo "0.409 0.518" ;;
-    darkgreen) echo "0.215 0.650" ;;   # deep forest green (signals carry no brightness)
+    green)  echo "0.198 0.53" ;;   # #3fc06e
     blue)   echo "0.167 0.040" ;;
     amber)  echo "0.550 0.420" ;;
     purple) echo "0.300 0.150" ;;
@@ -121,7 +120,8 @@ signal() {
     alternating)  [ -n "$c1" ] && [ -n "$c2" ] || { log "ERROR signal alternating needs two colors"; return 0; } ;;
     on_off_color) [ -n "$c1" ] || { log "ERROR signal on_off_color needs one color"; return 0; }; c2="" ;;
     on_off)       c1=""; c2="" ;;
-    *)            log "ERROR unknown signal '$sig' (alternating|on_off_color|on_off)"; return 0 ;;
+    breathe)      c1=""; c2=""; dur="${dur:-0}" ;;   # one smooth pulse in the current color (alert API, not signaling)
+    *)            log "ERROR unknown signal '$sig' (alternating|on_off_color|on_off|breathe)"; return 0 ;;
   esac
   case "$dur" in
     ''|*[!0-9]*) log "ERROR duration must be whole milliseconds, got '$dur'"; return 0 ;;
@@ -134,8 +134,12 @@ signal() {
     colors="$(printf '%s' "$colors" | jq -c --argjson x "${xy% *}" --argjson y "${xy#* }" '. + [{xy:{x:$x,y:$y}}]')"
   done
   local payload
-  payload="$(jq -nc --arg s "$sig" --argjson d "$dur" --argjson c "$colors" \
-    '{signaling:{signal:$s,duration:$d}} | if ($c|length) > 0 then .signaling.colors = $c else . end')"
+  if [ "$sig" = breathe ]; then
+    payload='{"alert":{"action":"breathe"}}'
+  else
+    payload="$(jq -nc --arg s "$sig" --argjson d "$dur" --argjson c "$colors" \
+      '{signaling:{signal:$s,duration:$d}} | if ($c|length) > 0 then .signaling.colors = $c else . end')"
+  fi
 
   # Group mode: one request to the room/zone's grouped_light; the bridge
   # groupcasts it so every bulb switches in the same instant.
@@ -601,7 +605,7 @@ usage: hue <command> [args]
 
   event <name>                                   run a named event (always exits 0)
   events                                         list events and their effects
-  signal <signal> <duration_ms> <color> [color2]  raw signal on the configured target (always exits 0)
+  signal <signal> [duration_ms] [color] [color2]  raw signal on the configured target (always exits 0)
   init [--keychain]                              guided terminal setup: pair, pick lights, test
   pair [--keychain] [--no-wait]                  pair with the bridge, write the app key
   discover                                       print bridge IP(s) via mDNS
@@ -610,8 +614,8 @@ usage: hue <command> [args]
   test                                           bridge reachability + auth check
   config [show|path|set KEY VALUE]               inspect or edit config.env
 
-signals: alternating (2 colors) | on_off_color (1 color) | on_off (none)
-colors:  red green darkgreen blue amber purple white
+signals: alternating (2 colors) | on_off_color (1 color) | on_off (none) | breathe (one pulse, current color)
+colors:  red green blue amber purple white
 target:  GROUP_ID (one request, all bulbs at once) if set, else each id in LIGHT_IDS
 config:  $CONFIG   (override the directory with HUE_CONFIG_DIR)
 EOT

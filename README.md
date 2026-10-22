@@ -45,8 +45,8 @@ claude plugin install hue@hue-claude
 
 | Hook | Event | Default effect |
 | :- | :- | :- |
-| `Stop` | `claude-done` | green, 3 s |
-| `Notification` (`permission_prompt`) | `claude-wait` | amber/red alternating, 5 s |
+| `Stop` | `claude-done` | solid green, 1.5 s |
+| `Notification` (`permission_prompt`) | `claude-wait` | amber/red alternating, 3 s |
 
 `Stop` fires after every response, including short ones. `Notification` is
 matched on `permission_prompt` only, so amber means Claude is blocked on an
@@ -69,8 +69,10 @@ claude-wait   alternating  8000 red  white
 build-failed  on_off_color 3000 red       # your own trigger
 ```
 
-Signals are `alternating` (two colors), `on_off_color` (one), `on_off` (none).
-Colors are `red green darkgreen blue amber purple white`. `hue events` lists everything.
+Signals are `alternating` (two colors), `on_off_color` (one), `on_off` (none),
+and `breathe` (one smooth pulse in the current color, no duration or colors).
+Two identical colors with `alternating` hold a solid color without blinking.
+Colors are `red green blue amber purple white`. `hue events` lists everything.
 
 **Your own triggers.** Anything that can run a command can flash the lights:
 
@@ -98,7 +100,7 @@ path of the Hue root CA.
 ```
 hue event <name>                run a named event (always exits 0)
 hue events                      list events and their effects
-hue signal <sig> <ms> <c> [c2]  raw signal on the configured target
+hue signal <sig> [ms] [c] [c2]  raw signal on the configured target
 hue init [--keychain]           guided terminal setup (use /hue:init inside Claude Code)
 hue pair [--keychain] [--no-wait]
 hue discover                    bridge IP(s) via mDNS

@@ -1,6 +1,6 @@
 {
   "name": "hue",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Flash Philips Hue lights when Claude Code finishes a turn or waits on a permission. Local bridge API, no cloud, bash + jq only.",
   "author": {
     "name": "Michael Mueller"
