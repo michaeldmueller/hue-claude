@@ -257,12 +257,17 @@ cmd_groups() {
 }
 
 cmd_lights() {
-  local body
+  local body rooms
   body="$(clip GET light)" || exit 1
-  printf '%s' "$body" | jq -r --arg ids " ${LIGHT_IDS:-} " '
-    ["ID","NAME","SIGNAL_VALUES",""],
-    (.data[] | [ .id, .metadata.name, ((.signaling.signal_values // []) | join(",")),
-                 (.id as $i | if ($ids | contains(" " + $i + " ")) then "* configured" else "" end) ])
+  # A light belongs to a device; a room lists devices as children. Map light -> room name.
+  rooms="$(clip GET room)" || rooms='{"data":[]}'
+  printf '%s' "$body" | jq -r --arg ids " ${LIGHT_IDS:-} " --argjson rooms "$rooms" '
+    ($rooms.data | map({ name: .metadata.name, devices: [ .children[] | select(.rtype=="device") | .rid ] })) as $rm
+    | ["ID","NAME","ROOM","SIGNAL_VALUES",""],
+      (.data[] | [ .id, .metadata.name,
+                   (.owner.rid as $d | ($rm[] | select(.devices | index($d)) | .name) // "-"),
+                   ((.signaling.signal_values // []) | join(",")),
+                   (.id as $i | if ($ids | contains(" " + $i + " ")) then "* configured" else "" end) ])
     | @tsv' | column -t -s "$(printf '\t')"
 }
 
@@ -599,7 +604,7 @@ usage: hue <command> [args]
   init [--keychain]                              guided terminal setup: pair, pick lights, test
   pair [--keychain] [--no-wait]                  pair with the bridge, write the app key
   discover                                       print bridge IP(s) via mDNS
-  lights                                         list lights: id, name, signal_values
+  lights                                         list lights: id, name, room, signal_values
   groups                                         list rooms/zones with their GROUP_ID
   test                                           bridge reachability + auth check
   config [show|path|set KEY VALUE]               inspect or edit config.env

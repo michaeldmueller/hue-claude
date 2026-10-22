@@ -29,16 +29,23 @@ Config is written to `~/.config/hue/config.env`. Never print the app key.
    `hue pair --no-wait`. On "link button was not pressed", ask them to press
    it and try once more. The pair command writes the key itself.
 
-4. **Choose lights.** Run `hue lights`. Show the names and whether each
-   supports `alternating` in its signal values. Lights without any signal
-   values cannot flash and should not be offered. Ask which lights to use,
-   then run `hue config set LIGHT_IDS "<id> <id> ..."` with the chosen IDs,
-   space separated.
+4. **Whole room or specific lights?** Run `hue groups` and show the rooms
+   and zones with their light counts. Ask whether they want a whole room or
+   zone to flash, or only certain lights. Most people want their office.
 
-5. **Optional group.** Run `hue groups`. If a room or zone matches what they
-   picked, offer it: one request to the group makes every bulb switch at the
-   same instant. If they want it, `hue config set GROUP_ID <id>`. Otherwise
-   leave it unset.
+5. **Set the target.**
+   - *Room or zone:* `hue config set GROUP_ID <id>` with the GROUP_ID from
+     the table. One request to the group makes every bulb switch at the same
+     instant. Nothing else is needed; `LIGHT_IDS` is ignored while a group
+     is set.
+   - *Specific lights:* run `hue lights`. It shows each light's name, its
+     room, and its signal values. Lights without any signal values cannot
+     flash and should not be offered. Ask which to use, then run
+     `hue config set LIGHT_IDS "<id> <id> ..."` with the chosen IDs, space
+     separated. If a group was set earlier, clear it with
+     `hue config set GROUP_ID ""`.
+   Do not query the bridge API directly; the two commands above give
+   everything needed.
 
 6. **Test.** Run `hue test`, then `hue event claude-done` and ask whether the
    lights flashed green. If not, check `~/.config/hue/logs/hooks.log` and the

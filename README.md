@@ -102,7 +102,7 @@ hue signal <sig> <ms> <c> [c2]  raw signal on the configured target
 hue init [--keychain]           guided terminal setup (use /hue:init inside Claude Code)
 hue pair [--keychain] [--no-wait]
 hue discover                    bridge IP(s) via mDNS
-hue lights                      lights with id, name, signal_values
+hue lights                      lights with id, name, room, signal_values
 hue groups                      rooms/zones with their grouped_light id
 hue test                        reachability + auth check
 hue config [show|path|set K V]  inspect or edit config.env
