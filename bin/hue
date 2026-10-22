@@ -17,8 +17,8 @@ export PATH
 builtin_event() {
   case "$1" in
 # BEGIN EVENTS
-claude-done)  signal on_off_color 3000 green ;;          # Claude Code finished a turn
-claude-wait)  signal alternating  5000 amber red ;;      # Claude Code is waiting on a permission
+claude-done)  signal alternating 1500 green white;;          # Claude Code finished a turn
+claude-wait)  signal alternating  3000 amber red ;;      # Claude Code is waiting on a permission
 # END EVENTS
     *) return 1 ;;
   esac
@@ -29,6 +29,7 @@ color_xy() {
   case "$1" in
     red)    echo "0.675 0.322" ;;
     green)  echo "0.409 0.518" ;;
+    darkgreen) echo "0.215 0.650" ;;   # deep forest green (signals carry no brightness)
     blue)   echo "0.167 0.040" ;;
     amber)  echo "0.550 0.420" ;;
     purple) echo "0.300 0.150" ;;
@@ -610,7 +611,7 @@ usage: hue <command> [args]
   config [show|path|set KEY VALUE]               inspect or edit config.env
 
 signals: alternating (2 colors) | on_off_color (1 color) | on_off (none)
-colors:  red green blue amber purple white
+colors:  red green darkgreen blue amber purple white
 target:  GROUP_ID (one request, all bulbs at once) if set, else each id in LIGHT_IDS
 config:  $CONFIG   (override the directory with HUE_CONFIG_DIR)
 EOT

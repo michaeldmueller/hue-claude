@@ -70,7 +70,7 @@ build-failed  on_off_color 3000 red       # your own trigger
 ```
 
 Signals are `alternating` (two colors), `on_off_color` (one), `on_off` (none).
-Colors are `red green blue amber purple white`. `hue events` lists everything.
+Colors are `red green darkgreen blue amber purple white`. `hue events` lists everything.
 
 **Your own triggers.** Anything that can run a command can flash the lights:
 
