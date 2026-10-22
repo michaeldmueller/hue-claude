@@ -32,9 +32,12 @@ claude plugin install hue@hue-claude
 
 ### Requirements
 
-- macOS. The script uses `dns-sd`, `security`, and the stock
-  `/bin/bash` 3.2.
-- `jq` (`brew install jq`) and `curl`.
+- macOS or Linux. Bash 3.2 or later (the stock macOS `/bin/bash` works),
+  `curl`, and `jq` (`brew install jq` / `apt install jq`).
+- Bridge discovery uses `dns-sd` on macOS or `avahi-browse` on Linux
+  (`apt install avahi-utils`). Without either it falls back to Hue's cloud
+  lookup, or you can type the IP during `/hue:init`.
+- Windows works through WSL or Git Bash, with the cloud lookup or a typed IP.
 - A square Hue Bridge (v2) on firmware with the CLIP v2 API (2021 or later).
 - Color bulbs that support signaling. `hue lights` shows which do.
 
