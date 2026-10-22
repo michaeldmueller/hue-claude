@@ -66,13 +66,14 @@ name:
 ```
 claude-done   on_off_color 2000 blue
 claude-wait   alternating  8000 red  white
-build-failed  on_off_color 3000 red       # your own trigger
+build-failed  on_off_color 3000 #ff6600   # your own trigger, hex colors work too
 ```
 
 Signals are `alternating` (two colors), `on_off_color` (one), `on_off` (none),
 and `breathe` (one smooth pulse in the current color, no duration or colors).
 Two identical colors with `alternating` hold a solid color without blinking.
-Colors are `red green blue amber purple white`. `hue events` lists everything.
+Colors are `red green blue amber purple white` or any hex value like `#3fc06e`.
+`hue events` lists everything.
 
 **Your own triggers.** Anything that can run a command can flash the lights:
 

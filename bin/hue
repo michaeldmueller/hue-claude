@@ -33,8 +33,27 @@ color_xy() {
     amber)  echo "0.550 0.420" ;;
     purple) echo "0.300 0.150" ;;
     white)  echo "0.313 0.329" ;;
+    \#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) hex_xy "$1" ;;
     *)      return 1 ;;
   esac
+}
+
+# "#rrggbb" -> CIE xy using the sRGB gamma curve and Philips' wide-gamut
+# matrix. Brightness is discarded: signals carry chromaticity only.
+hex_xy() {
+  awk -v h="${1#\#}" 'BEGIN {
+    for (i = 0; i < 3; i++) {
+      c = tolower(substr(h, 2*i+1, 2)); v = 0
+      for (j = 1; j <= 2; j++) v = v*16 + index("0123456789abcdef", substr(c, j, 1)) - 1
+      v /= 255
+      rgb[i] = (v > 0.04045) ? ((v + 0.055) / 1.055) ^ 2.4 : v / 12.92
+    }
+    X = rgb[0]*0.664511 + rgb[1]*0.154324 + rgb[2]*0.162028
+    Y = rgb[0]*0.283881 + rgb[1]*0.668433 + rgb[2]*0.047685
+    Z = rgb[0]*0.000088 + rgb[1]*0.072310 + rgb[2]*0.986039
+    s = X + Y + Z; if (s == 0) s = 1
+    printf "%.4f %.4f\n", X/s, Y/s
+  }'
 }
 
 # ---------------------------------------------------------------------------
@@ -179,7 +198,10 @@ signal() {
 # ---------------------------------------------------------------------------
 user_event_line() {
   [ -f "$EVENTS_CONF" ] || return 1
-  awk -v n="$1" '!/^[[:space:]]*#/ && $1==n { $1=""; sub(/^[[:space:]]+/, ""); sub(/[[:space:]]*#.*$/, ""); print; exit }' "$EVENTS_CONF" | grep .
+  # A field starting with # ends the line as a comment, unless it is a #rrggbb color.
+  awk -v n="$1" '!/^[[:space:]]*#/ && $1==n {
+    out=""; for (i=2; i<=NF; i++) { if ($i ~ /^#/ && $i !~ /^#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$/) break; out = out (out=="" ? "" : " ") $i }
+    print out; exit }' "$EVENTS_CONF" | grep .
 }
 
 run_event() {
@@ -221,7 +243,10 @@ cmd_events() {
   {
     printf 'EVENT\tEFFECT\tSOURCE / NOTE\n'
     if [ -f "$EVENTS_CONF" ]; then
-      awk '!/^[[:space:]]*#/ && NF>0 { name=$1; $1=""; sub(/^[[:space:]]+/, ""); note=""; if (match($0, /#.*$/)) { note=substr($0, RSTART+1); sub(/[[:space:]]*#.*$/, "") } sub(/[[:space:]]+$/, ""); printf "%s\t%s\tevents.conf %s\n", name, $0, note }' "$EVENTS_CONF"
+      awk '!/^[[:space:]]*#/ && NF>0 { name=$1; eff=""; note=""
+        for (i=2; i<=NF; i++) { if (note=="" && $i ~ /^#/ && $i !~ /^#[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]$/) { note=" "; sub(/^#/, "", $i) }
+          if (note=="") eff = eff (eff=="" ? "" : " ") $i; else if ($i!="") note = note (note==" " ? "" : " ") $i }
+        printf "%s\t%s\tevents.conf%s\n", name, eff, note }' "$EVENTS_CONF"
     fi
     sed -n '/^# BEGIN EVENTS$/,/^# END EVENTS$/p' "${BASH_SOURCE[0]}" \
       | sed -e '/^# BEGIN EVENTS$/d' -e '/^# END EVENTS$/d' \
@@ -615,7 +640,7 @@ usage: hue <command> [args]
   config [show|path|set KEY VALUE]               inspect or edit config.env
 
 signals: alternating (2 colors) | on_off_color (1 color) | on_off (none) | breathe (one pulse, current color)
-colors:  red green blue amber purple white
+colors:  red green blue amber purple white, or any #rrggbb
 target:  GROUP_ID (one request, all bulbs at once) if set, else each id in LIGHT_IDS
 config:  $CONFIG   (override the directory with HUE_CONFIG_DIR)
 EOT

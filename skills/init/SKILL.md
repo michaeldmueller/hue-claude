@@ -56,5 +56,5 @@ Config is written to `~/.config/hue/config.env`. Never print the app key.
      permission. Both are already active for every session.
    - `hue events` lists the effects. Custom events or different colors go in
      `~/.config/hue/events.conf`, one per line, for example
-     `claude-done on_off_color 2000 blue`.
+     `claude-done on_off_color 2000 blue`. Colors are names or `#rrggbb`.
    - `/hooks` shows the registered hooks.
