@@ -1,0 +1,628 @@
+#!/bin/bash
+# hue — flash Philips Hue lights on named events.
+# All Hue logic lives here. Callers only name an event: `hue event <name>`.
+# Compatible with macOS /bin/bash 3.2 (no associative arrays, no mapfile).
+
+set -u
+PATH="${PATH:-}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PATH
+
+# ---------------------------------------------------------------------------
+# Event table — callers never know about colors, light IDs, durations, or the
+# bridge. Add one line here per trigger. `hue events` prints this block.
+#   <name>)  signal <alternating|on_off_color|on_off> <duration_ms> [color] [color2] ;;
+# Users can override or add events without editing this file: see events.conf
+# in the config directory (`hue config path`).
+# ---------------------------------------------------------------------------
+builtin_event() {
+  case "$1" in
+# BEGIN EVENTS
+claude-done)  signal on_off_color 3000 green ;;          # Claude Code finished a turn
+claude-wait)  signal alternating  5000 amber red ;;      # Claude Code is waiting on a permission
+# END EVENTS
+    *) return 1 ;;
+  esac
+}
+
+# Color map — name → CIE xy (safe inside Gamut B/C; tweak to taste).
+color_xy() {
+  case "$1" in
+    red)    echo "0.675 0.322" ;;
+    green)  echo "0.409 0.518" ;;
+    blue)   echo "0.167 0.040" ;;
+    amber)  echo "0.550 0.420" ;;
+    purple) echo "0.300 0.150" ;;
+    white)  echo "0.313 0.329" ;;
+    *)      return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Config lives outside the plugin directory so it survives plugin updates.
+CONFIG_DIR="${HUE_CONFIG_DIR:-$HOME/.config/hue}"
+CONFIG="$CONFIG_DIR/config.env"
+EVENTS_CONF="$CONFIG_DIR/events.conf"
+LOG_DIR="$CONFIG_DIR/logs"
+BRIDGE_IP="" HUE_APP_KEY="" LIGHT_IDS="" GROUP_ID="" HUE_CACERT=""
+# shellcheck disable=SC1090
+[ -f "$CONFIG" ] && . "$CONFIG"
+
+log() { printf '%s hue: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die() { log "ERROR $*"; exit 1; }
+
+app_key() {
+  if [ -n "${HUE_APP_KEY:-}" ]; then
+    printf '%s' "$HUE_APP_KEY"
+  else
+    security find-generic-password -s hue-app-key -w 2>/dev/null
+  fi
+}
+
+# curl with the right TLS option, timeout, and silence.
+hcurl() {
+  if [ -n "${HUE_CACERT:-}" ]; then
+    curl -s --max-time 3 --cacert "$HUE_CACERT" "$@"
+  else
+    curl -s -k --max-time 3 "$@"
+  fi
+}
+
+# Authenticated CLIP v2 request. Usage: clip METHOD PATH [DATA]
+# Prints body; return code 0 if HTTP 2xx and no "errors", 2 if the bridge is
+# unreachable (curl failed), 1 for any other error.
+clip() {
+  local method="$1" path="$2" data="${3:-}" key body code tmp
+  key="$(app_key)"
+  [ -n "$key" ] || { log "ERROR no HUE_APP_KEY in $CONFIG or Keychain (run: hue pair)"; return 1; }
+  [ -n "${BRIDGE_IP:-}" ] || { log "ERROR BRIDGE_IP not set in $CONFIG (run: hue discover)"; return 1; }
+  tmp="$(mktemp -t hue)"
+  if [ -n "$data" ]; then
+    code="$(hcurl -X "$method" "https://$BRIDGE_IP/clip/v2/resource/$path" \
+      -H "hue-application-key: $key" -H "Content-Type: application/json" \
+      --data "$data" -o "$tmp" -w '%{http_code}')"
+  else
+    code="$(hcurl -X "$method" "https://$BRIDGE_IP/clip/v2/resource/$path" \
+      -H "hue-application-key: $key" -o "$tmp" -w '%{http_code}')"
+  fi
+  local rc=$?
+  body="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp"
+  printf '%s' "$body"
+  if [ "$rc" -ne 0 ]; then
+    log "ERROR bridge $BRIDGE_IP unreachable (curl exit $rc) for $method $path"; return 2
+  fi
+  case "$code" in
+    2*) ;;
+    401|403) log "ERROR bridge rejected the app key (HTTP $code) for $method $path; run: hue pair"; return 1 ;;
+    *)  case "$body" in
+          '<'*) log "ERROR bridge returned HTTP $code for $method $path" ;;
+          *)    log "ERROR bridge returned HTTP $code for $method $path: $(printf '%s' "$body" | head -c 300)" ;;
+        esac
+        return 1 ;;
+  esac
+  if printf '%s' "$body" | jq -e '(.errors // []) | length > 0' >/dev/null 2>&1; then
+    log "ERROR bridge rejected $method $path: $(printf '%s' "$body" | jq -c '.errors')"; return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# signal — the only place that sends effects to the bridge.
+# Usage: signal <alternating|on_off_color|on_off> <duration_ms> [color] [color2]
+# Target: GROUP_ID (one grouped_light request) if set, else each id in LIGHT_IDS.
+# Never fails the caller: logs problems and returns 0.
+# ---------------------------------------------------------------------------
+signal() {
+  local sig="${1:-}" dur="${2:-}" c1="${3:-}" c2="${4:-}" colors="[]" xy id n=0 fail=0
+  case "$sig" in
+    alternating)  [ -n "$c1" ] && [ -n "$c2" ] || { log "ERROR signal alternating needs two colors"; return 0; } ;;
+    on_off_color) [ -n "$c1" ] || { log "ERROR signal on_off_color needs one color"; return 0; }; c2="" ;;
+    on_off)       c1=""; c2="" ;;
+    *)            log "ERROR unknown signal '$sig' (alternating|on_off_color|on_off)"; return 0 ;;
+  esac
+  case "$dur" in
+    ''|*[!0-9]*) log "ERROR duration must be whole milliseconds, got '$dur'"; return 0 ;;
+  esac
+  [ "$dur" -le 65534000 ] || { log "ERROR duration $dur exceeds bridge max 65534000 ms"; return 0; }
+
+  local c
+  for c in $c1 $c2; do
+    xy="$(color_xy "$c")" || { log "ERROR unknown color '$c'"; return 0; }
+    colors="$(printf '%s' "$colors" | jq -c --argjson x "${xy% *}" --argjson y "${xy#* }" '. + [{xy:{x:$x,y:$y}}]')"
+  done
+  local payload
+  payload="$(jq -nc --arg s "$sig" --argjson d "$dur" --argjson c "$colors" \
+    '{signaling:{signal:$s,duration:$d}} | if ($c|length) > 0 then .signaling.colors = $c else . end')"
+
+  # Group mode: one request to the room/zone's grouped_light; the bridge
+  # groupcasts it so every bulb switches in the same instant.
+  if [ -n "${GROUP_ID:-}" ]; then
+    if clip PUT "grouped_light/$GROUP_ID" "$payload" >/dev/null; then
+      log "signal $sig ${dur}ms ${c1:-} ${c2:-} -> group $GROUP_ID"
+    else
+      log "WARN signal $sig $dur ${c1:-} ${c2:-}: group $GROUP_ID failed"
+    fi
+    return 0
+  fi
+
+  if [ -z "${LIGHT_IDS:-}" ]; then
+    log "ERROR LIGHT_IDS is empty and GROUP_ID is not set in $CONFIG (run: hue init, or /hue:init in Claude Code)"; return 0
+  fi
+  for id in $LIGHT_IDS; do
+    n=$((n+1))
+    [ "$n" -gt 1 ] && sleep 0.1          # bridge guidance: <=10 light commands/sec
+    clip PUT "light/$id" "$payload" >/dev/null
+    case $? in
+      0) ;;
+      2) fail=$((fail+1)); log "WARN bridge unreachable; skipping remaining lights"; break ;;
+      *) fail=$((fail+1)) ;;
+    esac
+  done
+  if [ "$fail" -gt 0 ]; then
+    log "WARN signal $sig $dur ${c1:-} ${c2:-}: $fail of $n light(s) failed"
+  else
+    log "signal $sig ${dur}ms ${c1:-} ${c2:-} -> $n light(s)"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Events: user events.conf first (one per line: name signal duration color
+# [color2]; '#' comments), then the built-in table.
+# ---------------------------------------------------------------------------
+user_event_line() {
+  [ -f "$EVENTS_CONF" ] || return 1
+  awk -v n="$1" '!/^[[:space:]]*#/ && $1==n { $1=""; sub(/^[[:space:]]+/, ""); sub(/[[:space:]]*#.*$/, ""); print; exit }' "$EVENTS_CONF" | grep .
+}
+
+run_event() {
+  local line
+  if line="$(user_event_line "$1")"; then
+    # shellcheck disable=SC2086
+    signal $line
+    return 0
+  fi
+  builtin_event "$1" || log "WARN unknown event '$1' (see: hue events)"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+# When invoked by a Claude Code hook, stdin carries a JSON payload describing
+# the trigger. Record it so spurious triggers can be traced to a session.
+log_hook_payload() {
+  local payload line
+  [ -t 0 ] && return 0                        # interactive: nothing on stdin
+  payload="$(cat 2>/dev/null)"
+  [ -n "$payload" ] || return 0               # launchd/cron: /dev/null
+  mkdir -p "$LOG_DIR"
+  line="$(printf '%s' "$payload" | jq -r '
+      [ (.hook_event_name // "?"), (.notification_type // "-"), (.message // "-"),
+        ((.session_id // "-") | .[0:8]), (.cwd // "-") ] | join(" | ")' 2>/dev/null)"
+  printf '%s event=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "${line:-$payload}" >>"$LOG_DIR/hooks.log"
+}
+
+cmd_event() {
+  [ -n "${1:-}" ] || { log "ERROR usage: hue event <name>"; exit 0; }
+  log_hook_payload "$1"
+  run_event "$1"
+  exit 0
+}
+
+cmd_events() {
+  {
+    printf 'EVENT\tEFFECT\tSOURCE / NOTE\n'
+    if [ -f "$EVENTS_CONF" ]; then
+      awk '!/^[[:space:]]*#/ && NF>0 { name=$1; $1=""; sub(/^[[:space:]]+/, ""); note=""; if (match($0, /#.*$/)) { note=substr($0, RSTART+1); sub(/[[:space:]]*#.*$/, "") } sub(/[[:space:]]+$/, ""); printf "%s\t%s\tevents.conf %s\n", name, $0, note }' "$EVENTS_CONF"
+    fi
+    sed -n '/^# BEGIN EVENTS$/,/^# END EVENTS$/p' "${BASH_SOURCE[0]}" \
+      | sed -e '/^# BEGIN EVENTS$/d' -e '/^# END EVENTS$/d' \
+            -e 's/^\([a-zA-Z0-9_-]*\))[[:space:]]*signal[[:space:]]*/\1\t/' \
+            -e 's/[[:space:]]*;;[[:space:]]*#\{0,1\}[[:space:]]*/\tbuilt-in: /' \
+      | tr -s ' '
+  } | column -t -s "$(printf '\t')"
+}
+
+cmd_signal() {
+  signal "$@"
+  exit 0
+}
+
+# Prints TSV: kind \t name \t grouped_light id \t light count
+fetch_groups() {
+  local rooms zones devices
+  rooms="$(clip GET room)" || return 1
+  zones="$(clip GET zone)" || return 1
+  devices="$(clip GET device)" || return 1
+  printf '%s' "$rooms" | jq -r --argjson dev "$devices" '
+    .data[] | [ "room", .metadata.name,
+      (.services[] | select(.rtype=="grouped_light") | .rid),
+      ([ .children[].rid as $d | $dev.data[] | select(.id==$d) | .services[] | select(.rtype=="light") ] | length) ] | @tsv'
+  printf '%s' "$zones" | jq -r '
+    .data[] | [ "zone", .metadata.name,
+      (.services[] | select(.rtype=="grouped_light") | .rid),
+      ([ .children[] | select(.rtype=="light") ] | length) ] | @tsv'
+}
+
+cmd_groups() {
+  local tsv
+  tsv="$(fetch_groups)" || exit 1
+  {
+    printf 'KIND\tNAME\tGROUP_ID\tLIGHTS\t\n'
+    printf '%s\n' "$tsv" | awk -F'\t' -v g="${GROUP_ID:-}" 'BEGIN{OFS="\t"} { print $1,$2,$3,$4,($3==g && g!="" ? "* configured" : "") }'
+  } | column -t -s "$(printf '\t')"
+}
+
+cmd_lights() {
+  local body
+  body="$(clip GET light)" || exit 1
+  printf '%s' "$body" | jq -r --arg ids " ${LIGHT_IDS:-} " '
+    ["ID","NAME","SIGNAL_VALUES",""],
+    (.data[] | [ .id, .metadata.name, ((.signaling.signal_values // []) | join(",")),
+                 (.id as $i | if ($ids | contains(" " + $i + " ")) then "* configured" else "" end) ])
+    | @tsv' | column -t -s "$(printf '\t')"
+}
+
+do_test() {
+  local bridge dev name count rid
+  bridge="$(clip GET bridge)" || { log "ERROR bridge test failed"; return 1; }
+  rid="$(printf '%s' "$bridge" | jq -r '.data[0].owner.rid // empty')"
+  name=""
+  if [ -n "$rid" ]; then
+    dev="$(clip GET "device/$rid")" && name="$(printf '%s' "$dev" | jq -r '.data[0].metadata.name // empty')"
+  fi
+  [ -n "$name" ] || name="$(printf '%s' "$bridge" | jq -r '.data[0].bridge_id // "unknown"')"
+  count="$(clip GET light | jq -r '.data | length')" || { log "ERROR could not list lights"; return 1; }
+  echo "Bridge: $name ($BRIDGE_IP)"
+  echo "Lights: $count"
+  local configured=0 id
+  for id in ${LIGHT_IDS:-}; do configured=$((configured+1)); done
+  if [ -n "${GROUP_ID:-}" ]; then
+    local gname
+    gname="$(fetch_groups 2>/dev/null | awk -F'\t' -v g="$GROUP_ID" '$3==g {print $1 " \"" $2 "\""; exit}')"
+    echo "Target: GROUP_ID ${gname:-"(id not found on bridge!)"} — signals go to the whole group at once"
+    echo "LIGHT_IDS ($configured) is ignored while GROUP_ID is set"
+  else
+    echo "Target: $configured light(s) in LIGHT_IDS"
+    [ "$configured" -gt 0 ] || { log "WARN no lights configured (run: hue init, or /hue:init in Claude Code)"; }
+  fi
+  echo "Config: $CONFIG"
+  return 0
+}
+
+cmd_test() { do_test; exit $?; }
+
+# Run a command for N seconds, then kill it; stdout is captured to a file whose
+# path is printed. (macOS has no `timeout`; dns-sd never exits on its own.)
+run_for() {
+  local secs="$1"; shift
+  local out; out="$(mktemp -t hue)"
+  "$@" >"$out" 2>/dev/null &
+  local pid=$!
+  sleep "$secs"
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  echo "$out"
+}
+
+discover_ips() {
+  local browse names name resolve host lookup ip found=0
+  browse="$(run_for 2 dns-sd -B _hue._tcp local.)"
+  # Lines look like: 12:00:00.000  Add  2  4 local.  _hue._tcp.  Philips Hue - ABCDEF
+  names="$(awk '/ Add /{ $1=$2=$3=$4=$5=$6=""; sub(/^ +/,""); print }' "$browse" | sort -u)"
+  rm -f "$browse"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    resolve="$(run_for 2 dns-sd -L "$name" _hue._tcp local.)"
+    host="$(sed -n 's/.*can be reached at \([^ ]*\):[0-9]*.*/\1/p' "$resolve" | head -n1)"
+    rm -f "$resolve"
+    [ -n "$host" ] || continue
+    lookup="$(run_for 2 dns-sd -G v4 "$host")"
+    ip="$(awk '/ Add /{print $6}' "$lookup" | head -n1)"
+    rm -f "$lookup"
+    [ -n "$ip" ] || ip="$(dscacheutil -q host -a name "${host%.}" 2>/dev/null | awk '/ip_address/{print $2; exit}')"
+    [ -n "$ip" ] || continue
+    echo "$ip"; found=1
+  done <<EOT
+$names
+EOT
+  if [ "$found" -eq 0 ]; then
+    log "mDNS found nothing; trying https://discovery.meethue.com"
+    curl -s --max-time 5 https://discovery.meethue.com 2>/dev/null | jq -r '.[]?.internalipaddress // empty' 2>/dev/null
+  fi
+}
+
+cmd_discover() {
+  local ips
+  ips="$(discover_ips)"
+  [ -n "$ips" ] || { log "ERROR no Hue bridge found on this network"; exit 1; }
+  echo "$ips"
+}
+
+# ---------------------------------------------------------------------------
+# config — read/write config.env (KEY=VALUE, shell syntax, chmod 600)
+# ---------------------------------------------------------------------------
+write_config() {
+  local key="$1" val="$2"
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$CONFIG" ] || { : >"$CONFIG"; chmod 600 "$CONFIG"; }
+  if grep -q "^$key=" "$CONFIG"; then
+    sed -i '' "s|^$key=.*|$key=$val|" "$CONFIG"
+  else
+    printf '%s=%s\n' "$key" "$val" >>"$CONFIG"
+  fi
+}
+
+cmd_config() {
+  local sub="${1:-show}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    path) echo "$CONFIG" ;;
+    show)
+      echo "config:  $CONFIG"
+      echo "events:  $EVENTS_CONF$([ -f "$EVENTS_CONF" ] || printf ' (absent)')"
+      echo "logs:    $LOG_DIR"
+      echo
+      echo "BRIDGE_IP=${BRIDGE_IP:-}"
+      if [ -n "${HUE_APP_KEY:-}" ]; then echo "HUE_APP_KEY=(set, ${#HUE_APP_KEY} chars)"
+      elif [ -n "$(app_key)" ]; then echo "HUE_APP_KEY=(empty; using Keychain)"
+      else echo "HUE_APP_KEY=(not set)"; fi
+      echo "LIGHT_IDS=\"${LIGHT_IDS:-}\""
+      echo "GROUP_ID=${GROUP_ID:-}"
+      echo "HUE_CACERT=${HUE_CACERT:-}" ;;
+    set)
+      local key="${1:-}" val="${2-}"
+      case "$key" in
+        BRIDGE_IP|HUE_APP_KEY|GROUP_ID|HUE_CACERT) [ $# -ge 2 ] || die "usage: hue config set $key <value>"; write_config "$key" "$val" ;;
+        LIGHT_IDS) [ $# -ge 2 ] || die "usage: hue config set LIGHT_IDS \"<id> <id> ...\""; write_config LIGHT_IDS "\"$val\"" ;;
+        *) die "usage: hue config set <BRIDGE_IP|HUE_APP_KEY|LIGHT_IDS|GROUP_ID|HUE_CACERT> <value>" ;;
+      esac
+      echo "wrote $key to $CONFIG" ;;
+    *) die "usage: hue config [show|path|set KEY VALUE]" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# pair — do_pair [--keychain] [--no-wait]: pairs and writes the key.
+# --no-wait skips the "press Enter" prompt (for non-interactive callers such
+# as Claude Code's /hue:init, where the user has already pressed the button).
+# ---------------------------------------------------------------------------
+do_pair() {
+  local use_keychain=0 wait=1 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --keychain) use_keychain=1 ;;
+      --no-wait)  wait=0 ;;
+      *) die "usage: hue pair [--keychain] [--no-wait]" ;;
+    esac
+  done
+  if [ -z "${BRIDGE_IP:-}" ]; then
+    log "BRIDGE_IP not set; discovering bridge..."
+    local ips; ips="$(discover_ips)"
+    case "$(printf '%s\n' "$ips" | grep -c .)" in
+      0) die "no bridge found; set it with: hue config set BRIDGE_IP <ip>" ;;
+      1) BRIDGE_IP="$ips"; write_config BRIDGE_IP "$BRIDGE_IP"; log "using bridge $BRIDGE_IP (written to $CONFIG)" ;;
+      *) die "multiple bridges found ($(printf '%s' "$ips" | tr '\n' ' ')); pick one with: hue config set BRIDGE_IP <ip>" ;;
+    esac
+  fi
+
+  local attempt resp username
+  for attempt in 1 2; do
+    if [ "$wait" -eq 1 ]; then
+      printf 'Press the link button on the bridge (%s), then press Enter. ' "$BRIDGE_IP"
+      read -r _ </dev/tty
+    fi
+    resp="$(hcurl -X POST "https://$BRIDGE_IP/api" -H 'Content-Type: application/json' \
+      --data '{"devicetype":"hue#claude-code","generateclientkey":true}')" \
+      || die "bridge $BRIDGE_IP unreachable"
+    username="$(printf '%s' "$resp" | jq -r '.[0].success.username // empty' 2>/dev/null)"
+    if [ -n "$username" ]; then
+      if [ "$use_keychain" -eq 1 ]; then
+        security add-generic-password -s hue-app-key -a "$USER" -w "$username" -U \
+          || die "could not store key in Keychain"
+        write_config HUE_APP_KEY ""
+        echo "Paired. App key stored in Keychain (service hue-app-key); HUE_APP_KEY left empty in $CONFIG."
+      else
+        write_config HUE_APP_KEY "$username"
+        echo "Paired. App key written to $CONFIG."
+      fi
+      HUE_APP_KEY="$username"
+      return 0
+    fi
+    if [ "$(printf '%s' "$resp" | jq -r '.[0].error.type // empty' 2>/dev/null)" = "101" ]; then
+      if [ "$wait" -eq 0 ]; then
+        die "link button was not pressed (bridge error 101); press it and run again"
+      elif [ "$attempt" -eq 1 ]; then
+        echo "Link button was not pressed. Trying once more."
+      else
+        die "link button was not pressed; pairing failed"
+      fi
+    else
+      die "unexpected response from bridge: $(printf '%s' "$resp" | head -c 300)"
+    fi
+  done
+}
+
+cmd_pair() {
+  do_pair "$@" || exit 1
+  echo "Next: hue lights → hue config set LIGHT_IDS \"<ids>\" → hue test   (or just run: hue init)"
+  exit 0
+}
+
+# ---------------------------------------------------------------------------
+# init — guided onboarding in a terminal: pair → pick lights → group → test
+# (In Claude Code, use /hue:init instead; it drives the same building blocks.)
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local ans keyflag=""
+  for ans in "$@"; do
+    case "$ans" in
+      --keychain) keyflag="--keychain" ;;
+      *) die "usage: hue init [--keychain]" ;;
+    esac
+  done
+  [ -r /dev/tty ] || die "hue init needs a terminal; inside Claude Code run /hue:init instead"
+  echo "hue init — config: $CONFIG"
+  echo
+
+  # Step 1: pair -----------------------------------------------------------
+  if [ -n "$(app_key)" ] && [ -n "${BRIDGE_IP:-}" ] && clip GET bridge >/dev/null 2>&1; then
+    echo "[1/4] Already paired with bridge $BRIDGE_IP."
+    printf '      Pair again? [y/N] '; read -r ans </dev/tty
+    case "$ans" in y|Y) do_pair $keyflag || exit 1 ;; esac
+  else
+    echo "[1/4] Pairing with the bridge."
+    do_pair $keyflag || exit 1
+  fi
+  echo
+
+  # Step 2: pick lights ----------------------------------------------------
+  echo "[2/4] Lights on bridge $BRIDGE_IP:"
+  local body
+  body="$(clip GET light)" || die "could not list lights"
+  local tsv; tsv="$(printf '%s' "$body" | jq -r '.data[] | [.id, (.metadata.name // "?"), ((.signaling.signal_values // []) | join(","))] | @tsv')"
+  [ -n "$tsv" ] || die "the bridge reports no lights"
+
+  local ids=() names=() sigs=() sel=() n=0 id name sig
+  while IFS="$(printf '\t')" read -r id name sig; do
+    ids[$n]="$id"; names[$n]="$name"; sigs[$n]="$sig"; sel[$n]=0
+    case " ${LIGHT_IDS:-} " in *" $id "*) sel[$n]=1 ;; esac   # pre-select current config
+    n=$((n+1))
+  done <<EOT
+$tsv
+EOT
+
+  show_picker() {
+    local i mark cap
+    echo
+    for i in $(seq 0 $((n-1))); do
+      [ "${sel[$i]}" -eq 1 ] && mark="[x]" || mark="[ ]"
+      case "${sigs[$i]}" in
+        *alternating*) cap="" ;;
+        *on_off_color*) cap="  (no alternating)" ;;
+        *) cap="  (no color signaling)" ;;
+      esac
+      printf '  %s %2d  %-28s %s%s\n' "$mark" $((i+1)) "${names[$i]}" "${ids[$i]}" "$cap"
+    done
+    echo
+  }
+
+  local tokens tok i
+  while :; do
+    show_picker
+    printf '      Toggle by number (e.g. 1 3 4), a = all, n = none, f = finish: '
+    read -r ans </dev/tty
+    case "$ans" in
+      f|F|done|'')
+        if [ "$(printf '%s\n' "${sel[@]}" | grep -c 1)" -eq 0 ]; then
+          printf '      No lights selected. Finish anyway? [y/N] '; read -r tok </dev/tty
+          case "$tok" in y|Y) break ;; *) continue ;; esac
+        fi
+        break ;;
+      a|A) for i in $(seq 0 $((n-1))); do sel[$i]=1; done ;;
+      n|N) for i in $(seq 0 $((n-1))); do sel[$i]=0; done ;;
+      q|Q) echo "Aborted; $CONFIG unchanged."; exit 1 ;;
+      *)
+        tokens="$(printf '%s' "$ans" | tr ',' ' ')"
+        for tok in $tokens; do
+          case "$tok" in
+            ''|*[!0-9]*) echo "      ? '$tok' is not a number" ;;
+            *) if [ "$tok" -ge 1 ] && [ "$tok" -le "$n" ]; then
+                 i=$((tok-1)); [ "${sel[$i]}" -eq 1 ] && sel[$i]=0 || sel[$i]=1
+               else echo "      ? no light number $tok"; fi ;;
+          esac
+        done ;;
+    esac
+  done
+
+  local chosen=""
+  for i in $(seq 0 $((n-1))); do
+    [ "${sel[$i]}" -eq 1 ] && chosen="$chosen${chosen:+ }${ids[$i]}"
+  done
+  write_config LIGHT_IDS "\"$chosen\""
+  LIGHT_IDS="$chosen"
+  echo "      Wrote LIGHT_IDS ($(printf '%s\n' "${sel[@]}" | grep -c 1) light(s)) to $CONFIG."
+  echo
+
+  # Step 3: optional room/zone group ---------------------------------------
+  echo "[3/4] Rooms and zones (optional). Picking one sends every signal as a single"
+  echo "      request to that whole group, so all its bulbs switch at the same instant."
+  echo "      This replaces LIGHT_IDS as the target while it is set."
+  local gtsv gkind gname gid gcount gids=() gn=0 gcur=""
+  gtsv="$(fetch_groups)" || die "could not list rooms/zones"
+  echo
+  while IFS="$(printf '\t')" read -r gkind gname gid gcount; do
+    [ -n "$gid" ] || continue
+    gids[$gn]="$gid"
+    [ "$gid" = "${GROUP_ID:-}" ] && gcur="*" || gcur=" "
+    printf '  %s %2d  %-5s %-22s %s lights\n' "$gcur" $((gn+1)) "$gkind" "$gname" "$gcount"
+    gn=$((gn+1))
+  done <<EOT
+$gtsv
+EOT
+  echo
+  while :; do
+    printf '      Group number to use, 0 = none (use LIGHT_IDS), Enter = keep current [%s]: ' "${GROUP_ID:-none}"
+    read -r ans </dev/tty
+    case "$ans" in
+      '') break ;;
+      0)  write_config GROUP_ID ""; GROUP_ID=""; echo "      GROUP_ID cleared; signals go to LIGHT_IDS."; break ;;
+      *[!0-9]*) echo "      ? '$ans' is not a number" ;;
+      *)  if [ "$ans" -ge 1 ] && [ "$ans" -le "$gn" ]; then
+            GROUP_ID="${gids[$((ans-1))]}"; write_config GROUP_ID "$GROUP_ID"
+            echo "      Wrote GROUP_ID=$GROUP_ID to $CONFIG."; break
+          else echo "      ? no group number $ans"; fi ;;
+    esac
+  done
+  echo
+
+  # Step 4: test + flash ---------------------------------------------------
+  echo "[4/4] Checking bridge:"
+  do_test || exit 1
+  if [ -n "$chosen" ] || [ -n "${GROUP_ID:-}" ]; then
+    printf '      Flash the target green now? [Y/n] '; read -r ans </dev/tty
+    case "$ans" in n|N) ;; *) signal on_off_color 2000 green ;; esac
+  fi
+  echo
+  echo "Done. Try: hue event claude-done   |   hue events   |   /hooks inside Claude Code"
+  exit 0
+}
+
+usage() {
+  cat <<EOT
+usage: hue <command> [args]
+
+  event <name>                                   run a named event (always exits 0)
+  events                                         list events and their effects
+  signal <signal> <duration_ms> <color> [color2]  raw signal on the configured target (always exits 0)
+  init [--keychain]                              guided terminal setup: pair, pick lights, test
+  pair [--keychain] [--no-wait]                  pair with the bridge, write the app key
+  discover                                       print bridge IP(s) via mDNS
+  lights                                         list lights: id, name, signal_values
+  groups                                         list rooms/zones with their GROUP_ID
+  test                                           bridge reachability + auth check
+  config [show|path|set KEY VALUE]               inspect or edit config.env
+
+signals: alternating (2 colors) | on_off_color (1 color) | on_off (none)
+colors:  red green blue amber purple white
+target:  GROUP_ID (one request, all bulbs at once) if set, else each id in LIGHT_IDS
+config:  $CONFIG   (override the directory with HUE_CONFIG_DIR)
+EOT
+}
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  init)     cmd_init "$@" ;;
+  event)    cmd_event "$@" ;;
+  events)   cmd_events ;;
+  signal)   cmd_signal "$@" ;;
+  lights)   cmd_lights ;;
+  groups)   cmd_groups ;;
+  pair)     cmd_pair "$@" ;;
+  test)     cmd_test ;;
+  discover) cmd_discover ;;
+  config)   cmd_config "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) log "ERROR unknown command '$cmd'"; usage >&2; exit 1 ;;
+esac

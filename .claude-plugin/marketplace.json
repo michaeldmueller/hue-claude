@@ -1,0 +1,12 @@
+{
+  "name": "claude-hue",
+  "owner": { "name": "Michael Mueller" },
+  "description": "Philips Hue status lights for Claude Code",
+  "plugins": [
+    {
+      "name": "hue",
+      "source": ".",
+      "description": "Flash Philips Hue lights when Claude Code finishes a turn or waits on a permission."
+    }
+  ]
+}

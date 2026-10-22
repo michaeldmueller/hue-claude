@@ -1,0 +1,20 @@
+{
+  "description": "Flash Hue lights: green when a turn finishes, amber/red while a permission prompt waits.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/hue\" event claude-done", "async": true }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/hue\" event claude-wait", "async": true }
+        ]
+      }
+    ]
+  }
+}
