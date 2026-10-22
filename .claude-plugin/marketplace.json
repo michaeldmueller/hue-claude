@@ -1,5 +1,5 @@
 {
-  "name": "claude-hue",
+  "name": "hue-claude",
   "owner": { "name": "Michael Mueller" },
   "description": "Philips Hue status lights for Claude Code",
   "plugins": [

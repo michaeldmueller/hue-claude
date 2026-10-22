@@ -197,7 +197,7 @@ log_hook_payload() {
   local payload line
   [ -t 0 ] && return 0                        # interactive: nothing on stdin
   payload="$(cat 2>/dev/null)"
-  [ -n "$payload" ] || return 0               # launchd/cron: /dev/null
+  [ -n "$payload" ] || return 0               # cron or empty stdin: nothing to log
   mkdir -p "$LOG_DIR"
   line="$(printf '%s' "$payload" | jq -r '
       [ (.hook_event_name // "?"), (.notification_type // "-"), (.message // "-"),

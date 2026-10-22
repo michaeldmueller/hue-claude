@@ -5,8 +5,8 @@
   "author": {
     "name": "Michael Mueller"
   },
-  "homepage": "https://github.com/michaeldmueller/claude-hue",
-  "repository": "https://github.com/michaeldmueller/claude-hue",
+  "homepage": "https://github.com/michaeldmueller/hue-claude",
+  "repository": "https://github.com/michaeldmueller/hue-claude",
   "license": "MIT",
   "keywords": [
     "hue",

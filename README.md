@@ -1,4 +1,4 @@
-# claude-hue
+# hue-claude
 
 Flash your Philips Hue lights when Claude Code finishes a turn or is waiting
 on a permission. Look up from the other screen, see green, come back.
@@ -16,8 +16,8 @@ on a permission. Look up from the other screen, see green, come back.
 Inside Claude Code:
 
 ```
-/plugin marketplace add michaeldmueller/claude-hue
-/plugin install hue@claude-hue
+/plugin marketplace add michaeldmueller/hue-claude
+/plugin install hue@hue-claude
 /hue:init
 ```
 
@@ -29,8 +29,8 @@ permission prompt is waiting.
 Or from the shell:
 
 ```
-claude plugin marketplace add michaeldmueller/claude-hue
-claude plugin install hue@claude-hue
+claude plugin marketplace add michaeldmueller/hue-claude
+claude plugin install hue@hue-claude
 ```
 
 ### Requirements
